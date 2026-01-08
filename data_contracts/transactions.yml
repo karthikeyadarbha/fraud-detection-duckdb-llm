@@ -1,0 +1,36 @@
+dataset: bankcorp.fraud.transactions
+title: "Canonical transactions (fraud detection)"
+owner: payments-data-team@example.com
+description: "Canonical, cleaned transaction records used by fraud models and analyst workflows."
+schema:
+  - name: tx_id
+    type: string
+    required: true
+    description: "Unique transaction identifier"
+  - name: account_id
+    type: string
+    required: true
+  - name: amount
+    type: double
+    required: true
+  - name: timestamp
+    type: timestamp
+    required: true
+slo:
+  freshness: "<= 30s"
+  availability: "99.9%"
+retention:
+  raw: "365 days"
+  derived: "3 years"
+pii_policy:
+  mask: true
+  pii_fields: [account_number, card_number, cardholder_name]
+provenance:
+  required: [ingestion_job_id, raw_source]
+quality_checks:
+  - id: tx_id_not_null
+    sql: "SELECT COUNT(*) FROM bankcorp.fraud.transactions WHERE tx_id IS NULL"
+    threshold: 0
+  - id: amount_positive
+    sql: "SELECT COUNT(*) FROM bankcorp.fraud.transactions WHERE amount <= 0"
+    threshold: 0
