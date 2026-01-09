@@ -17,6 +17,7 @@
 #     raise SystemExit(f"Request to {OLLAMA_URL} failed: {e}") from e
 
 import duckdb
-con = duckdb.connect("fraud_poc.db")  # or the path you use, or ':memory:' if in-memory
+con = duckdb.connect("notebooks/fraud_poc.db",read_only = True)  # or the path you use, or ':memory:' if in-memory
 # adjust table/column names: id, prompt, model_response_raw, risk_score
+
 print(con.execute("SELECT id, model, prompt, model_response_raw, response_text, risk_score FROM llm_results ORDER BY created_at DESC LIMIT 20").fetchall())
