@@ -22,8 +22,11 @@ def parse_risk_score(value):
         return math.nan
     # numeric types
     if isinstance(value, (int, float, np.integer, np.floating)):
-        v = float(value)
-        return math.nan if math.isnan(v) else v
+        try:
+            v = float(value)
+            return math.nan if math.isnan(v) else v
+        except (ValueError, TypeError):
+            return math.nan
     s = str(value).strip()
     # try JSON content
     try:

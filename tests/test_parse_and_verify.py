@@ -16,8 +16,8 @@ from src.llm.parse import parse_risk_score
 def test_parse_risk(val, expected):
     """Test parsing various risk score formats."""
     out = parse_risk_score(val)
-    if expected != expected:  # nan check
-        assert out != out  # nan != nan is True
+    if math.isnan(expected):
+        assert math.isnan(out)
     else:
         assert abs(out - expected) < 1e-6
 
@@ -64,7 +64,7 @@ def test_parse_risk_percentage():
 def test_parse_risk_invalid():
     """Test parsing invalid values."""
     result = parse_risk_score('invalid')
-    assert result != result  # Should be NaN
+    assert math.isnan(result)  # Should be NaN
     
     result = parse_risk_score('')
-    assert result != result  # Should be NaN
+    assert math.isnan(result)  # Should be NaN

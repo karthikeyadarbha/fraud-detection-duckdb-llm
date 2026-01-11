@@ -63,9 +63,11 @@ def compute_and_persist_features(db_path, topk=5):
     # Merge
     merged = amount_z_df.merge(velocity_df, on='tx_id', how='outer').merge(retrieval_df, on='tx_id', how='outer')
     merged = merged.fillna({'amount_z':0.0,'velocity_1h':0,'velocity_24h':0,'fraud_fraction_topk':0.0,'mean_similarity_topk':0.0})
-    merged['computed_at'] = pd.Timestamp.utcnow()
+    import datetime
+    merged['computed_at'] = datetime.datetime.now(datetime.timezone.utc)
     # write into llm_features table (replace or upsert)
     con.register('tmp_features', merged)
+    # Table creation is handled by migration script; create only if needed for standalone use
     con.execute('CREATE TABLE IF NOT EXISTS llm_features (tx_id VARCHAR PRIMARY KEY, amount_z DOUBLE, velocity_1h INTEGER, velocity_24h INTEGER, fraud_fraction_topk DOUBLE, mean_similarity_topk DOUBLE, computed_at TIMESTAMP)')
     con.execute('INSERT OR REPLACE INTO llm_features SELECT * FROM tmp_features')
     con.close()
