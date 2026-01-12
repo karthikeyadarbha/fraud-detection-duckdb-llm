@@ -1,36 +1,7 @@
-# Core PoC dependencies
-duckdb>=0.7.1
-pandas>=2.1.0
-numpy>=1.24.0,<2.0.0
-scikit-learn>=1.5.0
-sentence-transformers>=2.2.2
-tqdm>=4.65.0
-python-dotenv>=1.0.0
-
-# LLM provider (optional - only if you will call OpenAI)
-openai>=0.27.0
-
-# Notebook / dev tooling
-jupyterlab>=3.6.0
-ipykernel>=6.22.0
-nbstripout>=0.5.0
-pre-commit>=2.20.0
-
-# Vector search (optional)
-# Note: faiss-cpu can be tricky to install via pip on some platforms.
-# If pip install faiss-cpu fails, prefer installing via conda/mamba:
-#   mamba install -c conda-forge -c pytorch faiss-cpu
-# Uncomment if you will run FAISS locally:
-# faiss-cpu>=1.7.3
-
-# Easier ANN fallback (recommended if faiss isn't available)
-hnswlib>=0.7.0
-
-# Optional (for larger experiments / local LLM inference)
-# transformers>=4.35.0
-# accelerate>=0.20.3
-# sentencepiece>=0.1.99
-
-# Notes:
-# - Use conda/mamba for faiss/torch installs on many platforms to avoid binary incompatibilities.
-# - For a reproducible production install, pin exact versions with a constraints file or lockfile (pip freeze).
+duckdb==0.7.1
+pandas>=1.5
+numpy>=1.24
+requests>=2.28
+pytest>=7.0
+python-dateutil>=2.8
+urllib3>=1.26
