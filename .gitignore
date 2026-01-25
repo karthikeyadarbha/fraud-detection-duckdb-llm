@@ -54,3 +54,13 @@ htmlcov/
 # Temporary files
 *.tmp
 /tmp/
+
+# Large data files
+financial_fraud_detection_dataset.csv
+*.csv
+*.pkl
+*.parquet
+artifacts/*.csv
+artifacts/*.pkl
+artifacts/*.parquet
+artifacts/**/*.parquet

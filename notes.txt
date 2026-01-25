@@ -1,0 +1,7 @@
+Next actions you can ask me to do:
+- Scaffold these files into a repository and open a pull request (if you want a PR, say "create a pull request" and give the repo/branch details).
+- Adjust feature engineering for more fields (IP risk lookup, geo distance).
+- Replace Ollama call with OpenAI/Anthropic integration (I can add environment var support).
+- Add tests and a minimal GitHub Actions CI workflow.
+
+If you want me to create a PR in karthikeyadarbha/fraud-detection-duckdb-llm, tell me the target branch and confirm and I'll open one.

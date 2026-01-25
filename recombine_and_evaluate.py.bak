@@ -1,0 +1,119 @@
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+def prec_at_k(df, scorecol, k=100, labelcol='y'):
+    top = df.sort_values(scorecol, ascending=False).head(k)
+    return top[labelcol].sum() / k
+
+def evaluate_combinations(df, weights=[0.05,0.1,0.2,0.3,0.5], gating_thr=[0.2,0.3,0.4]):
+    results = []
+
+    # baseline and current final
+    results.append(("baseline", prec_at_k(df, 'baseline_score')))
+    results.append(("current_final", prec_at_k(df, 'final_score')))
+
+    # weighted combos on existing anomaly_score
+    for w in weights:
+        df['cand'] = df['baseline_score'] * (1 - w) + df['anomaly_score'] * w
+        results.append((f"weighted_w={w:.2f}", prec_at_k(df, 'cand')))
+
+    # gating: only boost baseline when baseline < thr (add 0.5*anom)
+    for thr in gating_thr:
+        df['cand'] = df['baseline_score'].copy()
+        mask = df['baseline_score'] < thr
+        df.loc[mask, 'cand'] = (df.loc[mask, 'baseline_score'] + 0.5 * df.loc[mask, 'anomaly_score']).clip(0,1)
+        results.append((f"boost_if_baseline_lt_{thr:.2f}", prec_at_k(df, 'cand')))
+
+    # multiplicative adjustments
+    for alpha in [0.25, 0.5, 1.0]:
+        df['cand'] = (df['baseline_score'] * (1 + alpha * df['anomaly_score'])).clip(0,1)
+        results.append((f"mult_alpha_{alpha}", prec_at_k(df, 'cand')))
+
+    # Rescale anomaly by observed percentiles (re-normalize)
+    p1 = df['anomaly_score'].quantile(0.01)
+    p99 = df['anomaly_score'].quantile(0.99)
+    if p99 > p1:
+        df['anom_rescaled'] = ((df['anomaly_score'] - p1) / (p99 - p1)).clip(0,1)
+        for w in weights:
+            df['cand'] = df['baseline_score'] * (1 - w) + df['anom_rescaled'] * w
+            results.append((f"rescaled_w={w:.2f}", prec_at_k(df, 'cand')))
+    else:
+        df['anom_rescaled'] = df['anomaly_score']
+
+    return results, df
+
+def main(args):
+    print("Loading results and labels...")
+    res = pd.read_parquet(args.results)
+    labels = pd.read_csv(args.labels, usecols=['transaction_id','is_fraud'])
+    df = labels.merge(res, on='transaction_id', how='left')
+
+    # create binary label y
+    df['y'] = df['is_fraud'].astype(str).str.upper().map({'TRUE':1,'FALSE':0}).fillna(0).astype(int)
+
+    # Quick stats
+    for col in ['baseline_score','anomaly_score','final_score']:
+        print(col, df[col].quantile([0,0.01,0.1,0.5,0.9,0.95,0.99,1]).to_dict())
+
+    results, df_out = evaluate_combinations(df)
+    print("\nPrecision@100 for candidate combos:")
+    for name, prec in results:
+        print(f"{name:25s} prec@100 = {prec:.3f}")
+
+    # Print best weighted or gated option
+    best = sorted([r for r in results if r[0].startswith('weighted') or r[0].startswith('rescaled') or r[0].startswith('boost_if')], key=lambda x: -x[1])
+    print("\nTop candidate combos (by prec@100):")
+    for name, prec in best[:10]:
+        print(name, prec)
+
+    # Save example: pick a conservative default if not provided
+    chosen_method = args.method
+    if chosen_method == 'weighted':
+        w = args.weight
+        df_out['final_recombo'] = df_out['baseline_score']*(1-w) + df_out['anomaly_score']*w
+    elif chosen_method == 'gated':
+        thr = args.baseline_thr
+        df_out['final_recombo'] = df_out['baseline_score'].copy()
+        mask = df_out['baseline_score'] < thr
+        df_out.loc[mask, 'final_recombo'] = (df_out.loc[mask, 'baseline_score'] + 0.5 * df_out.loc[mask, 'anomaly_score']).clip(0,1)
+    elif chosen_method == 'rescaled_weighted':
+        w = args.weight
+        p1 = df_out['anomaly_score'].quantile(0.01)
+        p99 = df_out['anomaly_score'].quantile(0.99)
+        if p99 > p1:
+            df_out['anom_rescaled'] = ((df_out['anomaly_score'] - p1) / (p99 - p1)).clip(0,1)
+        else:
+            df_out['anom_rescaled'] = df_out['anomaly_score']
+        df_out['final_recombo'] = df_out['baseline_score']*(1-w) + df_out['anom_rescaled']*w
+    else:
+        raise ValueError("unknown method")
+
+    # compute chosen metrics
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    y = df_out['y']
+    print("\nChosen recombination method:", chosen_method)
+    print("AUC baseline:", roc_auc_score(y, df_out['baseline_score']))
+    print("AUC final_recombo:", roc_auc_score(y, df_out['final_recombo']))
+    print("PR-AUC baseline:", average_precision_score(y, df_out['baseline_score']))
+    print("PR-AUC final_recombo:", average_precision_score(y, df_out['final_recombo']))
+    print("Precision@100 baseline:", prec_at_k(df_out, 'baseline_score'))
+    print("Precision@100 final_recombo:", prec_at_k(df_out, 'final_recombo'))
+
+    # Persist recombined results
+    out_path = args.out
+    to_save = df_out[['transaction_id','baseline_score','anomaly_score','final_recombo','y']]
+    to_save.to_parquet(out_path, index=False)
+    print("Wrote recombined results to", out_path)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results", default="artifacts/results_stream.parquet")
+    parser.add_argument("--labels", default="financial_fraud_detection_dataset.csv")
+    parser.add_argument("--out", default="artifacts/results_stream_recombined.parquet")
+    parser.add_argument("--method", choices=['weighted','gated','rescaled_weighted'], default='weighted')
+    parser.add_argument("--weight", type=float, default=0.05)
+    parser.add_argument("--baseline_thr", type=float, default=0.2)
+    args = parser.parse_args()
+    main(args)

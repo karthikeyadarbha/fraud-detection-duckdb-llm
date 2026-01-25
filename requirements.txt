@@ -1,0 +1,27 @@
+# Core data + ML libraries
+pandas>=1.5,<2.0
+numpy>=1.24,<2.0
+scikit-learn>=1.2,<2.0
+scipy>=1.10,<2.0
+
+# Gradient boosting
+lightgbm>=3.3,<4.0
+
+# Autoencoder / Deep Learning (allow TF builds for Python 3.12+)
+# TensorFlow 2.16+ supports Python 3.12. Adjust upper bound to include 2.16+.
+tensorflow>=2.16,<2.20
+
+# Utilities & I/O
+joblib>=1.2,<2.0
+#pyarrow>=8.0,<13.0
+tqdm>=4.64
+
+# Optional local analytical DB (useful for querying large datasets)
+duckdb>=0.7,<1.0
+
+# Optional: add if you plan to use experiment tracking or hyperparameter tuning
+# mlflow>=2.0
+# optuna>=3.0
+
+# NOTE: Ollama is a local LLM application/CLI and is NOT installed via pip.
+#       Install Ollama separately per its docs if you intend to run Level-3 locally.

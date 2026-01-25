@@ -1,0 +1,59 @@
+*** Begin Patch
+*** Update File: recombine_and_evaluate.py
+@@
++import os
++from pathlib import Path
++from utils.combiner import combine_scores, validate_and_apply_llm_adjustment
+@@
+-    # previous combine/recombine invocation here (example)
+-    # df_final = recombine(df_all, args.combine_mode, ...)
++    # --- Merge Level-2 anomaly scores if available (artifacts produced by Level-2 generator)
++    try:
++        # allow overriding path via env var to support different artifact dirs
++        anom_artifact_path = os.getenv('LEVEL2_ANOMALY_PATH', 'artifacts/level2_isof/anomaly_scores.parquet')
++        if Path(anom_artifact_path).exists():
++            df_anom = pd.read_parquet(anom_artifact_path)
++            # ensure transaction_id present in both before merging
++            if 'transaction_id' in df_all.columns and 'transaction_id' in df_anom.columns:
++                df_all = df_all.merge(df_anom, on='transaction_id', how='left')
++            else:
++                print(f"[warn] anomaly artifact {anom_artifact_path} missing transaction_id; skipping merge")
++        else:
++            # no anomaly artifact found; proceed without anomaly_score (combiner will handle)
++            pass
++    except Exception as _e:
++        print(f"[warn] failed to load/merge anomaly_scores artifact: {_e}")
++
++    # --- Validate and apply LLM adjustments (Level-3) if present
++    try:
++        df_all = validate_and_apply_llm_adjustment(
++            df_all,
++            adj_col='llm_adjustment',
++            evidence_col='llm_evidence_ids',
++            topk_ids_col='topk_evidence_ids',
++            max_delta=0.05
++        )
++    except Exception as _e:
++        print(f"[warn] LLM adjustment validation failed: {_e}")
++
++    # --- Determine combine parameters (respect CLI args and env override)
++    chosen_combine_mode = getattr(args, 'combine_mode', 'baseline')
++    anom_weight = getattr(args, 'anom_weight', 0.05)
++    try:
++        anom_gate_threshold = float(os.getenv('ANOM_GATE_THRESHOLD', 0.2))
++    except Exception:
++        anom_gate_threshold = 0.2
++    try:
++        guard_threshold = float(os.getenv('ANOM_MEDIAN_GUARD', 0.6))
++    except Exception:
++        guard_threshold = None
++
++    # --- Final combine via combiner utility (this will enforce the guard and apply gating/weights)
++    df_final = combine_scores(
++        df_all,
++        combine_mode=chosen_combine_mode,
++        anom_weight=anom_weight,
++        anom_gate_threshold=anom_gate_threshold,
++        guard_threshold=guard_threshold
++    )
+*** End Patch
