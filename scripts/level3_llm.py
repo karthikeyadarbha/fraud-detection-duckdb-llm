@@ -4,19 +4,14 @@ scripts/level3_llm.py
 
 Level-3 LLM runner for fraud triage (LLaMA via Ollama CLI by default).
 
-This is the updated version with robust handling of array-like cells in evidence/features columns
-(to avoid ambiguous truth-value errors when pandas returns array-like results for isna/notna).
-
-Usage (example):
-  PYTHONPATH=. python scripts/level3_llm.py \
-    --in artifacts/results_stream.parquet \
-    --evidence-file artifacts/topk_evidence.parquet \
-    --out_dir artifacts/level3_llm \
-    --model llama2 \
-    --max_delta 0.05 \
-    --sample_limit 1000 \
-    --use-ollama \
-    --timeout 30
+Features:
+- Tight SYSTEM_INSTRUCTIONS requiring strict JSON output (single or batched).
+- Robust Ollama caller (prefers `ollama run`, falls back to other commands).
+- Batch support via --batch-size to amortize startup latency.
+- Excludes anomaly_score from features passed to the LLM.
+- Validation, clamping to +/- max_delta, needs_review flag on failures.
+- Persists llm_raw.jsonl, llm_parsed.parquet, and manifest.json with timezone-aware timestamps.
+- Warm-up behavior: optional single warm-up call to Ollama to load model into memory before main loop.
 """
 from __future__ import annotations
 
@@ -26,7 +21,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,28 +29,34 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------
-# Helpers: prompt, call, parse
+# SYSTEM INSTRUCTIONS (tightened; batched-capable)
 # ---------------------------
 
 SYSTEM_INSTRUCTIONS = """
-You are a strict fraud-triage assistant. Answer ONLY with a single valid JSON object that matches the schema exactly.
+You are a strict fraud-triage assistant. RETURN EXACTLY valid JSON and NOTHING ELSE.
+Do NOT output any prose, commentary, markup, or extra tokens outside the JSON. The JSON must match
+the schema and types exactly.
 
-Schema:
+When Input contains a single transaction, return exactly a single JSON object matching the schema.
+When Input contains a transactions array (batched mode), return exactly a JSON array with one JSON
+object per input transaction in the same order. Do NOT include extra text or commentary.
+
+Schema (must match exactly for each object):
 {
   "transaction_id": "<string>",
-  "llm_adjustment": <number>,       # additive delta to baseline score (range -0.10 .. +0.10). Will be clamped by caller to +/-{max_delta}
-  "evidence_ids": ["E1","E2"],     # IDs referencing provided evidence items (must be subset of provided top_k_evidence ids)
-  "explanation": "<string>",        # concise factual explanation based ONLY on provided evidence (<=250 chars)
-  "confidence": <number>           # optional 0..1 numeric confidence
+  "llm_adjustment": <number>,       // additive delta to baseline_score (numeric)
+  "evidence_ids": ["E1","E2"],     // list of evidence IDs (must be subset of provided top_k_evidence ids)
+  "explanation": "<string>",        // concise factual explanation based ONLY on the provided top_k_evidence and features (<=250 chars)
+  "confidence": <number>            // optional (0.0 .. 1.0)
 }
 
-Rules:
-- DO NOT output any text outside the JSON object (no markdown, no comments).
-- Only reference evidence by id. evidence_ids MUST be a subset of the provided top_k_evidence ids.
-- llm_adjustment must be a numeric additive delta; we will clamp it to +/- the configured max_delta.
-- explanation must be concise and based solely on the evidence.
-- Temperature must be 0 (deterministic).
-- If you cannot produce a valid JSON that follows these rules, output the most faithful JSON indicating the reason, but keep the JSON schema shape.
+Strict rules:
+- Return EXACTLY the required JSON (single object or array). No surrounding text, no code fences.
+- evidence_ids MUST reference the ids exactly as provided in the top_k_evidence list for that transaction.
+- llm_adjustment must be numeric. The caller will clamp to +/- {max_delta:.4f}.
+- Keep explanation factual and based only on the provided top_k_evidence and features.
+- Temperature must be 0 (deterministic). Be concise.
+- If you cannot produce a valid JSON, return a JSON object (or an array of objects for batched input) following the schema shape and include a short explanation string describing the reason (still return valid JSON).
 """
 
 PROMPT_TEMPLATE = """
@@ -64,12 +65,15 @@ PROMPT_TEMPLATE = """
 Input:
 {input_json}
 
-Respond with the JSON object only.
+Respond with the JSON (a single JSON object for single-input or an array of objects for batched input) only.
 """
 
+# ---------------------------
+# Helpers: prompt, call, parse
+# ---------------------------
 
-def build_prompt(tx_row: Dict[str, Any], top_k_evidence: List[Dict[str, Any]], max_delta: float) -> str:
-    # tx_row should include transaction_id, baseline_score, features (dict)
+
+def build_prompt_single(tx_row: Dict[str, Any], top_k_evidence: List[Dict[str, Any]], max_delta: float) -> str:
     in_obj = {
         "transaction_id": tx_row.get("transaction_id"),
         "baseline_score": float(tx_row.get("baseline_score")) if tx_row.get("baseline_score") is not None else None,
@@ -82,11 +86,18 @@ def build_prompt(tx_row: Dict[str, Any], top_k_evidence: List[Dict[str, Any]], m
     return PROMPT_TEMPLATE.format(system=system.strip(), input_json=payload)
 
 
+def build_prompt_batch(tx_rows: List[Dict[str, Any]], max_delta: float) -> str:
+    in_obj = {"transactions": tx_rows, "max_delta": max_delta}
+    system = SYSTEM_INSTRUCTIONS.replace("{max_delta}", f"{max_delta:.4f}")
+    payload = json.dumps(in_obj, ensure_ascii=False, indent=2)
+    return PROMPT_TEMPLATE.format(system=system.strip(), input_json=payload)
+
+
 def call_ollama_generate(model: str, prompt: str, timeout: int = 30) -> str:
     """
-    Robust Ollama caller: detect available Ollama subcommand and invoke it,
-    piping the prompt via stdin. Returns stdout string or raises RuntimeError.
-    Prefers 'run' (present on your system), falls back to 'generate' or 'chat'.
+    Robust Ollama caller: prefer `ollama run <model>` (available in many CLI installs),
+    fall back to generate/chat if present. Pipes the prompt to stdin and returns stdout.
+    Raises RuntimeError with diagnostic details on failure.
     """
     def _run_cmd(cmd):
         proc = subprocess.run(cmd, input=prompt.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
@@ -94,7 +105,7 @@ def call_ollama_generate(model: str, prompt: str, timeout: int = 30) -> str:
         stderr = proc.stderr.decode("utf-8", errors="replace")
         return proc.returncode, stdout, stderr
 
-    # Probe ollama --help to find available subcommands (best-effort)
+    # Probe help text to detect available subcommands
     try:
         help_proc = subprocess.run(["ollama", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         help_text = (help_proc.stdout.decode("utf-8", errors="replace") + help_proc.stderr.decode("utf-8", errors="replace")).lower()
@@ -103,7 +114,6 @@ def call_ollama_generate(model: str, prompt: str, timeout: int = 30) -> str:
     except Exception:
         help_text = ""
 
-    # Preferred order for your environment (run is available)
     candidates = []
     if "run" in help_text:
         candidates.append(("run", ["ollama", "run", model]))
@@ -112,7 +122,7 @@ def call_ollama_generate(model: str, prompt: str, timeout: int = 30) -> str:
     if "chat" in help_text:
         candidates.append(("chat", ["ollama", "chat", model, "--no-stream"]))
 
-    # Always include fallback attempts in reasonable order if not detected
+    # Add fallback attempts (in reasonable order)
     for name, cmd in [("run", ["ollama", "run", model]),
                       ("generate", ["ollama", "generate", model, "--temperature", "0"]),
                       ("chat", ["ollama", "chat", model, "--no-stream"])]:
@@ -123,52 +133,43 @@ def call_ollama_generate(model: str, prompt: str, timeout: int = 30) -> str:
     for name, cmd in candidates:
         try:
             rc, out, err = _run_cmd(cmd)
-            # Prefer returning stdout if available
             if rc == 0 and out:
                 return out
-            # Sometimes the command returns rc==0 but useful output is on stderr (rare). Capture errors to summarize.
-            last_err.append((cmd, rc, err.strip() or out.strip()))
+            last_err.append((cmd, rc, (err.strip() or out.strip())))
         except subprocess.TimeoutExpired:
             last_err.append((cmd, "timeout", "command timed out"))
         except Exception as e:
             last_err.append((cmd, "exc", str(e)))
 
-    # No candidate succeeded
     err_lines = "\n".join([f"cmd={c} rc={r} err={e}" for (c, r, e) in last_err])
     raise RuntimeError(f"ollama run/generate/chat attempts failed. Details:\n{err_lines}")
 
 
 def extract_first_json(s: str) -> Optional[str]:
-    """
-    Try to extract the first JSON object substring from s. Returns JSON string or None.
-    Heuristic: find first '{' then find matching '}'.
-    """
     if not isinstance(s, str):
         return None
     start = s.find("{")
     if start == -1:
-        return None
+        start = s.find("[")
+        if start == -1:
+            return None
     depth = 0
     end = None
     for i in range(start, len(s)):
         ch = s[i]
-        if ch == "{":
+        if ch == "{" or ch == "[":
             depth += 1
-        elif ch == "}":
+        elif ch == "}" or ch == "]":
             depth -= 1
             if depth == 0:
                 end = i
                 break
     if end is None:
         return None
-    return s[start : end + 1]
+    return s[start:end + 1]
 
 
 def parse_json_loose(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Try to load JSON from s directly, or extract a JSON substring if s contains extraneous text.
-    Returns (parsed_obj or None, raw_json_str_or_None)
-    """
     if not isinstance(s, str):
         return None, None
     try:
@@ -196,9 +197,6 @@ def parse_and_validate_llm_response(
     topk_ids: List[str],
     max_delta: float,
 ) -> Dict[str, Any]:
-    """
-    Parse raw LLM text and apply validation & clamping, returning a dict with standardized fields.
-    """
     out = {
         "transaction_id": input_tx_id,
         "llm_adjustment_raw": None,
@@ -220,24 +218,20 @@ def parse_and_validate_llm_response(
 
     out["parsed_json"] = parsed
 
-    # Validate fields
     txid = parsed.get("transaction_id")
     if txid != input_tx_id:
         out["parse_error"] = "txid_mismatch"
         return out
 
-    # evidence ids
     eids = parsed.get("evidence_ids", [])
     if not isinstance(eids, list):
         out["parse_error"] = "evidence_ids_not_list"
         return out
-    # ensure subset
     if not set(eids).issubset(set(topk_ids)):
         out["parse_error"] = "evidence_ids_not_subset_of_topk"
         return out
     out["llm_evidence_ids"] = eids
 
-    # llm_adjustment
     adj = parsed.get("llm_adjustment")
     try:
         adj_val = float(adj)
@@ -246,14 +240,12 @@ def parse_and_validate_llm_response(
         return out
     out["llm_adjustment_raw"] = adj_val
 
-    # explanation
     expl = parsed.get("explanation", "")
     if not isinstance(expl, str):
         out["parse_error"] = "explanation_not_string"
         return out
-    out["explanation"] = expl[:1000]  # truncate to reasonable length
+    out["explanation"] = expl[:1000]
 
-    # confidence (optional)
     conf = parsed.get("confidence", None)
     try:
         if conf is not None:
@@ -262,7 +254,6 @@ def parse_and_validate_llm_response(
     except Exception:
         out["confidence"] = None
 
-    # All validations passed; clamp adjustment
     clamped = max(-max_delta, min(max_delta, out["llm_adjustment_raw"]))
     out["llm_adjustment_clamped"] = float(clamped)
     out["llm_adjustment_valid"] = True
@@ -298,6 +289,20 @@ def write_raw_jsonl(path: Path, row: Dict[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def chunked_iterable(iterable, size):
+    it = iter(iterable)
+    while True:
+        chunk = []
+        try:
+            for _ in range(size):
+                chunk.append(next(it))
+        except StopIteration:
+            if chunk:
+                yield chunk
+            break
+        yield chunk
+
+
 def run_level3(
     input_path: Path,
     evidence_path: Optional[Path],
@@ -310,13 +315,15 @@ def run_level3(
     start: Optional[int],
     end: Optional[int],
     topk_col: str,
+    batch_size: int = 1,
+    warmup: bool = True,
+    warmup_timeout: int = 300,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_out_path = out_dir / "llm_raw.jsonl"
     parsed_out_path = out_dir / "llm_parsed.parquet"
     manifest_path = out_dir / "manifest.json"
 
-    # Read input dataframe
     if not input_path.exists():
         print(f"[error] input file {input_path} not found", file=sys.stderr)
         return 2
@@ -329,11 +336,9 @@ def run_level3(
     if sample_limit:
         df = df.head(sample_limit)
 
-    # optional start/end slicing
     if start is not None or end is not None:
         df = df.iloc[start:end]
 
-    # helper to detect missing scalar values safely (don't call pd.isna on array-likes)
     def _is_missing_scalar(x):
         if x is None:
             return True
@@ -344,7 +349,6 @@ def run_level3(
         except Exception:
             return False
 
-    # Load evidence mapping if provided
     evidence_map: Dict[str, List[Dict[str, Any]]] = {}
     if evidence_path:
         if not evidence_path.exists():
@@ -356,7 +360,6 @@ def run_level3(
         elif suf2 in (".csv", ".txt"):
             ev_df = pd.read_csv(evidence_path)
         else:
-            # try jsonl
             try:
                 with open(evidence_path, "r", encoding="utf-8") as fh:
                     for line in fh:
@@ -375,7 +378,6 @@ def run_level3(
                     evidence_map[tx] = []
                     continue
 
-                # If it's already a JSON string, try to parse it to list/dict
                 if isinstance(val, str):
                     try:
                         parsed = json.loads(val)
@@ -386,11 +388,9 @@ def run_level3(
                         else:
                             evidence_map[tx] = [{"id": "E1", "text": str(parsed)}]
                     except Exception:
-                        # Not JSON; treat as a single textual evidence item
                         evidence_map[tx] = [{"id": "E1", "text": val}]
                     continue
 
-                # If it's list/tuple/ndarray/Series, coerce to list
                 if isinstance(val, (list, tuple)):
                     evidence_map[tx] = list(val)
                 elif isinstance(val, (pd.Series, np.ndarray)):
@@ -401,111 +401,215 @@ def run_level3(
                 elif isinstance(val, dict):
                     evidence_map[tx] = [val]
                 else:
-                    # Fallback: coerce scalar to single evidence item
                     evidence_map[tx] = [{"id": "E1", "text": str(val)}]
 
-    # Prepare loop
     results: List[LLMResultRow] = []
     total = len(df)
-    print(f"[info] running Level-3 LLM on {total} rows; model={model}; max_delta={max_delta}")
+    print(f"[info] running Level-3 LLM on {total} rows; model={model}; max_delta={max_delta}; batch_size={batch_size}")
 
-    for idx, row in df.reset_index(drop=True).iterrows():
+    # Optional warm-up: run a single request to load model into memory (does not add to parsed results)
+    if use_ollama and warmup and total > 0:
         try:
-            txid = str(row.get("transaction_id"))
-            baseline_score = row.get("baseline_score", None)
-
-            # gather features for prompt (robust to array-like)
-            features = None
-            raw_features_cell = row.get("features", None) if "features" in row else None
-            if not _is_missing_scalar(raw_features_cell):
-                val = raw_features_cell
-                if isinstance(val, str):
-                    try:
-                        features = json.loads(val)
-                    except Exception:
-                        features = {"raw_features": val}
-                elif isinstance(val, (dict, list)):
-                    features = val
-                else:
-                    features = {"features": val}
-            else:
-                features = {}
-                for c in df.columns:
-                    if c in ("transaction_id", "baseline_score", topk_col):
-                        continue
-                    v = row.get(c)
-                    # include simple scalars only
-                    if isinstance(v, (int, float, str, bool)) and not isinstance(v, (list, tuple, pd.Series, np.ndarray)):
-                        features[c] = v
-
-            # --- Robust collect top_k evidence for this tx ---
+            # Build a tiny warm-up prompt using the first row's minimal context if available
+            first_row = df.reset_index(drop=True).iloc[0]
+            txid = str(first_row.get("transaction_id"))
+            # extract a minimal top_k for warmup
             if evidence_map:
-                top_k = evidence_map.get(txid, [])
+                top_k = evidence_map.get(txid, [])[:1]
             else:
-                if topk_col and topk_col in df.columns:
-                    raw_e = row.get(topk_col)
-                    # handle missing / NaN values robustly
-                    is_missing = _is_missing_scalar(raw_e)
-
-                    if is_missing:
-                        top_k = []
-                    else:
-                        if isinstance(raw_e, str):
-                            try:
-                                parsed = json.loads(raw_e)
-                                if isinstance(parsed, (list, tuple)):
-                                    top_k = list(parsed)
-                                elif isinstance(parsed, dict):
-                                    top_k = [parsed]
-                                else:
-                                    top_k = [{"id": "E1", "text": str(parsed)}]
-                            except Exception:
-                                top_k = [{"id": "E1", "text": raw_e}]
-                        elif isinstance(raw_e, (list, tuple)):
-                            top_k = list(raw_e)
-                        elif isinstance(raw_e, (pd.Series, np.ndarray)):
-                            try:
-                                top_k = list(raw_e.tolist())
-                            except Exception:
-                                top_k = [{"id": "E1", "text": str(raw_e)}]
-                        elif isinstance(raw_e, dict):
-                            top_k = [raw_e]
-                        else:
+                top_k = []
+                if topk_col in df.columns:
+                    raw_e = first_row.get(topk_col)
+                    if not _is_missing_scalar(raw_e):
+                        try:
+                            parsed = json.loads(raw_e) if isinstance(raw_e, str) else raw_e
+                            if isinstance(parsed, (list, tuple)):
+                                top_k = parsed[:1]
+                            elif isinstance(parsed, dict):
+                                top_k = [parsed]
+                        except Exception:
                             top_k = [{"id": "E1", "text": str(raw_e)}]
-                else:
-                    top_k = []
-            # --- end robust collect ---
+            # warmup prompt (single)
+            warm_prompt = build_prompt_single({"transaction_id": "WARMUP", "baseline_score": 0.0, "features": {}}, top_k, max_delta)
+            start_w = time.time()
+            try:
+                warm_raw = call_ollama_generate(model, warm_prompt, timeout=warmup_timeout)
+            except Exception as e:
+                warm_raw = f"__OLLAMA_WARMUP_ERROR__ {repr(e)}"
+            warm_elapsed = time.time() - start_w
+            warm_line = {
+                "transaction_id": "WARMUP",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "prompt": "<warmup prompt>",
+                "raw_output": warm_raw,
+                "model": model,
+                "elapsed_seconds": warm_elapsed,
+            }
+            try:
+                write_raw_jsonl(raw_out_path, warm_line)
+            except Exception:
+                pass
+            print(f"[info] warmup completed, elapsed={warm_elapsed:.2f}s")
+        except Exception as e:
+            print(f"[warn] warmup failed: {e}")
 
-            # ensure evidence items have id+text
-            canonical_topk: List[Dict[str, str]] = []
-            for i, e in enumerate(top_k):
-                if isinstance(e, dict) and "id" in e and "text" in e:
-                    canonical_topk.append({"id": str(e["id"]), "text": str(e["text"])})
-                else:
-                    canonical_topk.append({"id": f"E{i+1}", "text": str(e)})
+    # Build per-row data in memory first for easier batching
+    rows_for_batching = []
+    for idx, row in df.reset_index(drop=True).iterrows():
+        txid = str(row.get("transaction_id"))
+        baseline_score = row.get("baseline_score", None)
 
-            prompt = build_prompt({"transaction_id": txid, "baseline_score": baseline_score, "features": features}, canonical_topk, max_delta)
-
-            # call LLM
-            start_t = time.time()
-            if use_ollama:
+        # gather features for prompt (robust to array-like); DO NOT include anomaly_score
+        raw_features_cell = row.get("features", None) if "features" in row else None
+        if not _is_missing_scalar(raw_features_cell):
+            val = raw_features_cell
+            if isinstance(val, str):
                 try:
-                    raw_out = call_ollama_generate(model, prompt, timeout=timeout)
-                except Exception as e:
-                    raw_out = f'__OLLAMA_ERROR__ {repr(e)}'
+                    features = json.loads(val)
+                except Exception:
+                    features = {"raw_features": val}
+            elif isinstance(val, (dict, list)):
+                features = val
             else:
-                raw_out = "__NO_RUNNER__"
+                features = {"features": val}
+        else:
+            features = {}
+            # exclude anomaly_score from features passed to LLM
+            for c in df.columns:
+                if c in ("transaction_id", "baseline_score", topk_col, "anomaly_score"):
+                    continue
+                v = row.get(c)
+                # include only simple scalar fields
+                if isinstance(v, (int, float, str, bool)) and not isinstance(v, (list, tuple, pd.Series, np.ndarray)):
+                    features[c] = v
 
-            elapsed = time.time() - start_t
+        # If the features object contains anomaly_score, remove it explicitly
+        if isinstance(features, dict) and "anomaly_score" in features:
+            features.pop("anomaly_score", None)
 
-            # parse and validate
-            topk_ids = [e["id"] for e in canonical_topk]
-            parsed_valid = parse_and_validate_llm_response(raw_out, txid, topk_ids, max_delta)
+        if evidence_map:
+            top_k = evidence_map.get(txid, [])
+        else:
+            if topk_col and topk_col in df.columns:
+                raw_e = row.get(topk_col)
+                is_missing = _is_missing_scalar(raw_e)
 
-            # build result row
+                if is_missing:
+                    top_k = []
+                else:
+                    if isinstance(raw_e, str):
+                        try:
+                            parsed = json.loads(raw_e)
+                            if isinstance(parsed, (list, tuple)):
+                                top_k = list(parsed)
+                            elif isinstance(parsed, dict):
+                                top_k = [parsed]
+                            else:
+                                top_k = [{"id": "E1", "text": str(parsed)}]
+                        except Exception:
+                            top_k = [{"id": "E1", "text": raw_e}]
+                    elif isinstance(raw_e, (list, tuple)):
+                        top_k = list(raw_e)
+                    elif isinstance(raw_e, (pd.Series, np.ndarray)):
+                        try:
+                            top_k = list(raw_e.tolist())
+                        except Exception:
+                            top_k = [{"id": "E1", "text": str(raw_e)}]
+                    elif isinstance(raw_e, dict):
+                        top_k = [raw_e]
+                    else:
+                        top_k = [{"id": "E1", "text": str(raw_e)}]
+            else:
+                top_k = []
+
+        canonical_topk: List[Dict[str, str]] = []
+        for i, e in enumerate(top_k):
+            if isinstance(e, dict) and "id" in e and "text" in e:
+                canonical_topk.append({"id": str(e["id"]), "text": str(e["text"])})
+            else:
+                canonical_topk.append({"id": f"E{i+1}", "text": str(e)})
+
+        rows_for_batching.append({
+            "transaction_id": txid,
+            "baseline_score": baseline_score,
+            "features": features,
+            "top_k_evidence": canonical_topk,
+            "row_index": idx
+        })
+
+    # Now process in batches
+    processed = 0
+    for batch in chunked_iterable(rows_for_batching, batch_size):
+        # Build prompt: single or batched
+        if len(batch) == 1:
+            prompt = build_prompt_single(
+                {
+                    "transaction_id": batch[0]["transaction_id"],
+                    "baseline_score": batch[0]["baseline_score"],
+                    "features": batch[0]["features"],
+                },
+                batch[0]["top_k_evidence"],
+                max_delta,
+            )
+        else:
+            tx_rows_for_prompt = []
+            for b in batch:
+                tx_rows_for_prompt.append({
+                    "transaction_id": b["transaction_id"],
+                    "baseline_score": (float(b["baseline_score"]) if b["baseline_score"] is not None else None),
+                    "features": b["features"],
+                    "top_k_evidence": b["top_k_evidence"]
+                })
+            prompt = build_prompt_batch(tx_rows_for_prompt, max_delta)
+
+        start_t = time.time()
+        if use_ollama:
+            try:
+                raw_out = call_ollama_generate(model, prompt, timeout=timeout)
+            except Exception as e:
+                raw_out = f'__OLLAMA_ERROR__ {repr(e)}'
+        else:
+            raw_out = "__NO_RUNNER__"
+        elapsed = time.time() - start_t
+
+        # Parse the raw_out. Expected: single JSON obj or list of objs
+        parsed_top, parsed_str = parse_json_loose(raw_out)
+        # If parsed_top is a list, map one-to-one by order; if dict and batch=1, map; if dict and batch>1, try to map by txid keys
+        mapped_results = {}
+        if isinstance(parsed_top, list):
+            # map by order - if lengths match map by order, otherwise try mapping by transaction_id
+            if len(parsed_top) == len(batch):
+                for i, obj in enumerate(parsed_top):
+                    mapped_results[batch[i]["transaction_id"]] = (obj, json.dumps(obj, ensure_ascii=False))
+            else:
+                for obj in parsed_top:
+                    if isinstance(obj, dict) and "transaction_id" in obj:
+                        mapped_results[str(obj["transaction_id"])] = (obj, json.dumps(obj, ensure_ascii=False))
+        elif isinstance(parsed_top, dict):
+            # Single dict returned
+            if len(batch) == 1:
+                mapped_results[batch[0]["transaction_id"]] = (parsed_top, json.dumps(parsed_top, ensure_ascii=False))
+            else:
+                # Maybe returned an object keyed by txid
+                for k, v in parsed_top.items():
+                    if isinstance(v, dict):
+                        mapped_results[str(k)] = (v, json.dumps(v, ensure_ascii=False))
+
+        # For any tx in batch not mapped, we'll set raw parsed outcome to the entire raw_out (parser will try to extract)
+        for b in batch:
+            txid = b["transaction_id"]
+            topk_ids = [e["id"] for e in b["top_k_evidence"]]
+            if txid in mapped_results:
+                obj, obj_str = mapped_results[txid]
+                raw_text_for_tx = obj_str
+            else:
+                raw_text_for_tx = raw_out
+
+            parsed_valid = parse_and_validate_llm_response(raw_text_for_tx, txid, topk_ids, max_delta)
+
             rr = LLMResultRow(
                 transaction_id=txid,
-                baseline_score=(float(baseline_score) if baseline_score is not None else None),
+                baseline_score=(float(b["baseline_score"]) if b["baseline_score"] is not None else None),
                 llm_adjustment_raw=(parsed_valid.get("llm_adjustment_raw") if parsed_valid.get("llm_adjustment_raw") is not None else None),
                 llm_adjustment_clamped=float(parsed_valid.get("llm_adjustment_clamped", 0.0)),
                 llm_adjustment_valid=bool(parsed_valid.get("llm_adjustment_valid", False)),
@@ -515,15 +619,14 @@ def run_level3(
                 needs_review=bool(parsed_valid.get("needs_review", True)),
                 llm_raw_output=raw_out,
                 llm_parsed_json=parsed_valid.get("parsed_json"),
-                prompt_ref=f"prompt_tx_{txid}",
-                timestamp_utc=datetime.utcnow().isoformat() + "Z",
+                prompt_ref=f"prompt_batch_{processed // batch_size}",
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
             )
 
-            # persist raw line
             raw_line = {
                 "transaction_id": txid,
                 "timestamp_utc": rr.timestamp_utc,
-                "prompt": prompt,
+                "prompt": prompt if len(batch) == 1 else f"<batched prompt; batch_size={len(batch)}>",
                 "raw_output": raw_out,
                 "model": model,
                 "elapsed_seconds": elapsed,
@@ -535,17 +638,10 @@ def run_level3(
 
             results.append(rr)
 
-            # progress logging
-            if (idx + 1) % 100 == 0:
-                print(f"[info] processed {idx+1}/{total} rows (last tx={txid})")
+        processed += len(batch)
+        if processed % 100 == 0 or processed == total:
+            print(f"[info] processed {processed}/{total} rows (last batch size={len(batch)})")
 
-        except KeyboardInterrupt:
-            print("[info] interrupted by user")
-            break
-        except Exception as e:
-            print(f"[error] row {idx} txid {row.get('transaction_id')} failed: {e}", file=sys.stderr)
-
-    # build parsed DataFrame
     parsed_rows = []
     for r in results:
         parsed_rows.append({
@@ -569,13 +665,13 @@ def run_level3(
     else:
         print("[warn] no parsed rows to write")
 
-    # write manifest
     manifest = {
         "model": model,
         "runner": "ollama" if use_ollama else "noop",
         "max_delta": max_delta,
         "sample_count": len(results),
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "batch_size": batch_size,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
@@ -589,17 +685,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--in", dest="input", required=True, help="Input parquet/csv with transaction_id & baseline_score")
     p.add_argument("--evidence-file", dest="evidence", default=None, help="Optional evidence file (parquet/csv/jsonl) mapping transaction_id->top_k_evidence")
     p.add_argument("--out_dir", default="artifacts/level3_llm", help="Output directory for LLM artifacts")
-    p.add_argument("--model", default="llama2", help="LLM model name for ollama generate")
+    p.add_argument("--model", default="llama2", help="LLM model name for ollama run")
     p.add_argument("--max_delta", type=float, default=0.05, help="Max absolute additive delta LLM may propose (will be clamped)")
     p.add_argument("--sample_limit", type=int, default=None, help="If set, only run on first N rows")
-    # allow both flags to explicitly enable or disable Ollama
     p.add_argument("--use-ollama", dest="use_ollama", action="store_true", help="Enable Ollama CLI runner")
     p.add_argument("--no-ollama", dest="use_ollama", action="store_false", help="Disable Ollama CLI runner")
-    p.set_defaults(use_ollama=False)  # default: disabled; explicit --use-ollama turns it on
-    p.add_argument("--timeout", type=int, default=30, help="Timeout seconds for each LLM call")
+    p.set_defaults(use_ollama=False)
+    p.add_argument("--timeout", type=int, default=120, help="Timeout seconds for each LLM call (increased default to tolerate cold starts)")
+    p.add_argument("--warmup-timeout", type=int, default=300, help="Timeout seconds for the warmup call (longer)")
+    p.add_argument("--no-warmup", dest="warmup", action="store_false", help="Disable warmup call")
+    p.add_argument("--warmup", dest="warmup", action="store_true", help="Enable warmup call (default)")
+    p.set_defaults(warmup=True)
     p.add_argument("--start", type=int, default=None, help="Start row index (inclusive)")
     p.add_argument("--end", type=int, default=None, help="End row index (exclusive)")
     p.add_argument("--topk-col", dest="topk_col", default="top_k_evidence", help="Column name in input that contains top_k_evidence if no evidence-file provided")
+    p.add_argument("--batch-size", dest="batch_size", type=int, default=1, help="Number of transactions to batch per LLM call (>=1). Batching amortizes latency.")
     return p.parse_args()
 
 
@@ -613,9 +713,12 @@ def main() -> int:
     sample_limit = int(args.sample_limit) if args.sample_limit else None
     use_ollama = bool(args.use_ollama)
     timeout = int(args.timeout)
+    warmup_timeout = int(args.warmup_timeout)
     start = args.start
     end = args.end
     topk_col = args.topk_col
+    batch_size = max(1, int(args.batch_size))
+    warmup = bool(args.warmup)
 
     rc = run_level3(
         input_path=in_path,
@@ -629,6 +732,9 @@ def main() -> int:
         start=start,
         end=end,
         topk_col=topk_col,
+        batch_size=batch_size,
+        warmup=warmup,
+        warmup_timeout=warmup_timeout,
     )
     return rc
 
