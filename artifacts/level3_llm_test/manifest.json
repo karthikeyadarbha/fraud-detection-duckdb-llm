@@ -1,7 +1,0 @@
-{
-  "model": "llama2",
-  "runner": "ollama",
-  "max_delta": 0.05,
-  "sample_count": 1,
-  "created_at": "2026-01-24T17:41:02.328282Z"
-}
