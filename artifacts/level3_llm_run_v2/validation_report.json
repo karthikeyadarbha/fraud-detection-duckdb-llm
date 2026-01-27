@@ -1,0 +1,43 @@
+{
+  "rows": 100,
+  "max_delta_used": 0.05,
+  "missing_columns": [
+    "llm_raw_output"
+  ],
+  "needs_review_count": 81,
+  "needs_review_rate": 0.81,
+  "llm_valid_count": 19,
+  "llm_valid_rate": 0.19,
+  "parse_error_counts": {},
+  "evidence_mismatch_count": 0,
+  "evidence_mismatch_examples": [],
+  "missing_topk_count": 0,
+  "clamped_mismatch_count": 0,
+  "clamped_mismatch_examples": [],
+  "at_limit_count": 17,
+  "at_limit_rate": 0.17,
+  "confidence_bad_count": 5,
+  "long_explanation_count": 0,
+  "long_explanation_examples": [],
+  "duplicate_tx_count": 0,
+  "llm_raw_total_lines": 100,
+  "ollama_error_count": 0,
+  "ollama_error_rate": 0.0,
+  "elapsed_median": 3.574307084083557,
+  "elapsed_mean": 3.6097725415229798,
+  "elapsed_p90": 3.9885122776031494,
+  "results_rows": 5000000,
+  "parsed_not_in_results_count": 0,
+  "parsed_not_in_results_examples": [],
+  "verdicts": {
+    "needs_review_rate_ok": false,
+    "parse_error_ok": true,
+    "ollama_error_ok": true,
+    "clamped_ok": true,
+    "at_limit_rate_ok": true,
+    "confidence_ok": false,
+    "explanation_len_ok": true,
+    "latency_ok": true
+  },
+  "passed_all": false
+}

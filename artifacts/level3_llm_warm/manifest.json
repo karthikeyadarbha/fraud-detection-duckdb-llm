@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-01-27T18:00:47.834845+00:00",
+  "model": "llama3.2:1b",
+  "max_delta": 0.05,
+  "rows": 1,
+  "sample_limit": 1,
+  "batch_size": 1,
+  "timeout": 300,
+  "warmup": true,
+  "use_ollama": true,
+  "out_dir": "artifacts/level3_llm_warm"
+}
